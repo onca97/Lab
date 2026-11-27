@@ -1,0 +1,80 @@
+name: APK bauen
+
+# Universelle Vorlage: Lade eine Projekt-ZIP nach dem Muster  name-vX.Y.Z.zip  ins Repo.
+# Gebaut wird automatisch die ZIP mit der höchsten Versionsnummer.
+# Ergebnis: name-vX.Y.Z.apk unter Actions -> letzter Lauf -> Artifacts.
+# Klappt mit normalen Android-Projekten (Gradle) und mit Capacitor-Projekten.
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Neueste Projekt-ZIP finden und entpacken
+        run: |
+          # nach Versionsnummer sortieren (nicht nach Namen); Web-Update-ZIPs (…-web-v…) ignorieren
+          ZIP=$(for f in *-v*.zip; do [ -e "$f" ] || continue; case "$f" in *-web-v*) continue;; esac
+                v=$(echo "$f" | sed -E 's/^.*-v([0-9][0-9.]*)\.zip$/\1/'); echo "$v $f"; done | sort -V -k1,1 | tail -1 | cut -d' ' -f2-)
+          if [ -z "$ZIP" ]; then echo "::error::Keine Projekt-ZIP im Repo (Name muss so aussehen: app-v1.0.0.zip)"; exit 1; fi
+          NAME=$(basename "$ZIP" .zip | sed -E 's/-v[0-9][0-9.]*$//')
+          VERSION=$(basename "$ZIP" .zip | sed -E 's/^.*-v([0-9][0-9.]*)$/\1/')
+          echo "Baue $ZIP  (Name: $NAME, Version: $VERSION)"
+          echo "NAME=$NAME" >> $GITHUB_ENV
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          rm -rf projekt && mkdir projekt && unzip -q "$ZIP" -d projekt
+          CAP=$(find projekt -maxdepth 4 -name "capacitor.config.*" -not -path "*/node_modules/*" | head -1)
+          if [ -n "$CAP" ]; then
+            echo "CAPDIR=$(dirname "$CAP")" >> $GITHUB_ENV
+            echo "PROJ=$(dirname "$CAP")/android" >> $GITHUB_ENV
+          else
+            SETTINGS=$(find projekt \( -name settings.gradle -o -name settings.gradle.kts \) -not -path "*/node_modules/*" | head -1)
+            if [ -z "$SETTINGS" ]; then echo "::error::Kein Android-Projekt (settings.gradle) in der ZIP gefunden"; exit 1; fi
+            echo "PROJ=$(dirname "$SETTINGS")" >> $GITHUB_ENV
+          fi
+
+      - uses: actions/setup-node@v4
+        if: env.CAPDIR != ''
+        with:
+          node-version: 20
+
+      - name: Capacitor vorbereiten
+        if: env.CAPDIR != ''
+        working-directory: ${{ env.CAPDIR }}
+        run: |
+          npm ci || npm install
+          npm run build --if-present
+          if [ ! -d android ]; then npx cap add android; fi
+          npx cap sync android
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.14.3
+
+      - name: APK bauen
+        working-directory: ${{ env.PROJ }}
+        run: |
+          if [ -f gradlew ]; then chmod +x gradlew; G=./gradlew; else G=gradle; fi
+          $G assembleRelease --no-daemon || true
+          APK=$(find . -path "*outputs/apk/release/*.apk" -not -name "*unsigned*" | head -1)
+          if [ -z "$APK" ]; then
+            echo "Keine signierte Release-APK – baue Debug-APK"
+            $G assembleDebug --no-daemon
+            APK=$(find . -path "*outputs/apk/debug/*.apk" | head -1)
+          fi
+          if [ -z "$APK" ]; then echo "::error::Es wurde keine APK erzeugt"; exit 1; fi
+          cp "$APK" "$GITHUB_WORKSPACE/$NAME-v$VERSION.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}-v${{ env.VERSION }}
+          path: ${{ env.NAME }}-v${{ env.VERSION }}.apk
